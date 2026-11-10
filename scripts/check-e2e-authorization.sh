@@ -22,9 +22,11 @@
 # payload); it must be on PR_NUMBER and by COMMENTER_LOGIN. The commenter must
 # have admin, maintain or write (collaborator permission API), else
 # reason=untrusted_commenter. The first line of the comment must be
-# `/ok-to-test` followed by 7 to 40 hex characters, else reason=missing_sha.
-# The run is authorized (reason=ok_to_test) only when the PR head sha, read
-# when this script runs, starts with the named sha. Any other head means the
+# `/ok-to-test` followed by the full 40-character sha, else reason=missing_sha.
+# A short prefix is refused: the author controls the reviewed commit and can
+# grind another commit with the same prefix ahead of time. The run is
+# authorized (reason=ok_to_test) only when the PR head sha, read when this
+# script runs, equals the named sha. Any other head means the
 # PR changed since the review (reason=stale_ok_to_test). No timing is used.
 #
 # Usage: check-e2e-authorization.sh PR_NUMBER OWNER/REPO
@@ -212,7 +214,7 @@ if [[ "${EVENT_NAME:-}" == "issue_comment" ]]; then
   else
     first_line="${comment_body%%$'\n'*}"
     first_line="${first_line%$'\r'}"
-    ok_to_test_re='^/ok-to-test[[:space:]]+([0-9a-fA-F]{7,40})[[:space:]]*$'
+    ok_to_test_re='^/ok-to-test[[:space:]]+([0-9a-fA-F]{40})[[:space:]]*$'
     named_sha=""
     if [[ "${first_line}" =~ ${ok_to_test_re} ]]; then
       named_sha="$(tr '[:upper:]' '[:lower:]' <<<"${BASH_REMATCH[1]}")"
@@ -223,7 +225,7 @@ if [[ "${EVENT_NAME:-}" == "issue_comment" ]]; then
 
     if [[ -z "${named_sha}" ]]; then
       reason="missing_sha"
-    elif [[ "${head_sha}" == "${named_sha}"* ]]; then
+    elif [[ "${head_sha}" == "${named_sha}" ]]; then
       authorized=true
       reason="ok_to_test"
     else

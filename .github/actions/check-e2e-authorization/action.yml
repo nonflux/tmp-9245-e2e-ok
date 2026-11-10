@@ -119,7 +119,7 @@ runs:
         "
             ;;
           issue_comment:missing_sha)
-            body+="\`/ok-to-test\` must name the reviewed commit. After reviewing the current head, someone with write access comments \`/ok-to-test ${HEAD_SHA:0:12}\`. A later push needs a new comment.
+            body+="\`/ok-to-test\` must name the commit you reviewed, as its full 40-character sha: \`/ok-to-test <sha>\`. The PR head is now \`${HEAD_SHA}\`; if that is not the commit you reviewed, review it first. A later push needs a new comment.
         "
             ;;
           issue_comment:untrusted_commenter)
