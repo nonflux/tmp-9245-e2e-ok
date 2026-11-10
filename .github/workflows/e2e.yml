@@ -1,0 +1,221 @@
+name: E2E Tests
+
+# Same-repo PRs run behaviour and playback on pull_request (secrets available;
+# the gate job authorizes the author before either suite checks out PR head).
+# Fork PRs get no secrets on pull_request: the suites skip until a maintainer
+# comments /ok-to-test, and e2e-ok-to-test.yml calls this workflow for the
+# authorized head sha (event_name issue_comment, inputs.head_sha) (#9245).
+# No pull_request_target: GitHub blocks it by default from 2026-12-02.
+
+permissions: {}
+
+on:
+  push:
+    branches: [main]
+    # SYNC-WITH: behaviour and playback relevance filters below.
+    # push.paths includes both filters; each job grep may be narrower.
+    paths:
+      - 'go.mod'
+      - 'e2e/**'
+      - 'pkg/behaviourtest/**'
+      - 'internal/security/hooks/**'
+      - 'internal/sentencetoken/english.json'
+      - 'internal/sandbox/**'
+      - 'internal/cli/github.go'
+      - 'internal/layers/**'
+      - 'internal/harness/**'
+      - 'internal/mintclient/**'
+      - 'Makefile'
+      - '.github/workflows/e2e.yml'
+      - '.github/workflows/reusable-dispatch.yml'
+      - 'action.yml'
+      - 'scripts/check-e2e-authorization.sh'
+  pull_request:
+    # Fork PRs: /ok-to-test is handled by e2e-ok-to-test.yml via workflow_call.
+    types: [opened, synchronize, reopened]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      run_playback:
+        description: Run the playback behaviour suite
+        required: true
+        type: boolean
+        default: true
+  workflow_call:
+    # Only e2e-ok-to-test.yml calls this, from an authorized /ok-to-test comment.
+    inputs:
+      pr_number:
+        description: Pull request number the comment authorized
+        type: number
+        required: true
+      head_sha:
+        description: PR head sha the comment authorized (checked out by both suites)
+        type: string
+        required: true
+    outputs:
+      behaviour_result:
+        description: behaviour job status (success, failure or cancelled)
+        value: ${{ jobs.behaviour.outputs.result }}
+      playback_result:
+        description: playback job status (success, failure or cancelled)
+        value: ${{ jobs.playback.outputs.result }}
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+        && format('e2e-{0}', github.event.pull_request.number)
+        || github.event_name == 'issue_comment'
+        && format('e2e-ok-to-test-{0}', inputs.pr_number)
+        || format('{0}-{1}', github.workflow, github.ref) }}
+  # /ok-to-test runs are authorization, not a code change: they queue in their
+  # own group and are never cancelled (the caller reports their result).
+  # Cancel for opened/synchronize/reopened and for non-main non-PR triggers.
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request'
+        || (github.event_name != 'issue_comment' && github.ref != 'refs/heads/main') }}
+
+jobs:
+  gate:
+    # Separate job so pull-requests: write stays out of suite jobs that
+    # check out PR-head code and run behaviour/playback tests with secrets.
+    # Never checkout github.event.pull_request.head.sha here.
+    # Same-repo PRs only (gh-aw's guard): a fork PR's pull_request token is
+    # read-only and it gets no secrets, so forks go through /ok-to-test.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.id == github.repository_id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      authorized: ${{ steps.auth.outputs.authorized }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}  # Base only — never checkout PR head in gate
+
+      - name: Check PR authorization
+        id: auth
+        uses: ./.github/actions/check-e2e-authorization
+        with:
+          pr_number: ${{ github.event.pull_request.number }}
+          repository: ${{ github.repository }}
+          pr_updated_at: ${{ github.event.pull_request.updated_at }}
+          event_action: ${{ github.event.action }}
+          pr_author_association: ${{ github.event.pull_request.author_association }}
+          pr_author_login: ${{ github.event.pull_request.user.login }}
+          label_actor_login: ${{ github.event.sender.login }}
+
+  behaviour:
+    # Share a group with playback only for stage; dev jobs reserve separate orgs.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.run_id }}-${{ github.event_name == 'push' && 'stage-org' || 'behaviour-dev' }}
+      cancel-in-progress: false
+    # Gate authorization protects checkout of untrusted PR-head code with secrets.
+    # Runs only on authorized PRs, merge_group (required check; treated as
+    # PR-class / dev), and push to main (stage). Skip workflow_dispatch.
+    # Environment uses event_name, not github.ref: pull_request sets
+    # github.ref to refs/pull/N/merge and issue_comment to the default branch.
+    needs: gate
+    if: >-
+      !cancelled() &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'merge_group') ||
+        (github.event_name == 'pull_request' && needs.gate.outputs.authorized == 'true') ||
+        (github.event_name == 'issue_comment' && inputs.head_sha != '')
+      )
+    # Scalar form keeps default deployment: true so runs list under Environments.
+    environment: ${{ github.event_name == 'push' && 'stage' || 'dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      # Read by e2e-ok-to-test.yml to complete the behaviour check run on the PR head.
+      result: ${{ steps.result.outputs.result }}
+    env:
+      ENVIRONMENT: ${{ github.event_name == 'push' && 'stage' || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: >-
+            ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
+                || github.event_name == 'issue_comment' && inputs.head_sha
+                || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'issue_comment' }}
+
+      - name: Probe (behaviour)
+        env:
+          PROBE_SECRET: ${{ secrets.PROBE_SECRET }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "event=${EVENT_NAME} checked_out=$(git rev-parse HEAD) secret_present=$([[ -n "${PROBE_SECRET}" ]] && echo yes || echo no)"
+          cat probe.txt 2>/dev/null || true
+          if [[ -f fail-behaviour ]]; then echo "fail-behaviour marker present"; exit 1; fi
+
+      - name: Record job result
+        id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: echo "result=${JOB_STATUS}" >> "$GITHUB_OUTPUT"
+
+
+  playback:
+    # Serialize with behaviour only on stage, whose pool has a single org.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.run_id }}-${{ github.event_name == 'push' && 'stage-org' || 'playback-dev' }}
+      cancel-in-progress: false
+    # Manual dispatch uses the selected trusted branch and the dev environment.
+    needs: gate
+    if: >-
+      !cancelled() &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'merge_group') ||
+        (github.event_name == 'workflow_dispatch' && inputs.run_playback) ||
+        (github.event_name == 'pull_request' && needs.gate.outputs.authorized == 'true') ||
+        (github.event_name == 'issue_comment' && inputs.head_sha != '')
+      )
+    # Scalar form keeps default deployment: true so runs list under Environments.
+    environment: ${{ github.event_name == 'push' && 'stage' || 'dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      # Read by e2e-ok-to-test.yml to complete the playback check run on the PR head.
+      result: ${{ steps.result.outputs.result }}
+    env:
+      ENVIRONMENT: ${{ github.event_name == 'push' && 'stage' || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: >-
+            ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
+                || github.event_name == 'issue_comment' && inputs.head_sha
+                || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'issue_comment' }}
+
+      - name: Probe (playback)
+        env:
+          PROBE_SECRET: ${{ secrets.PROBE_SECRET }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "event=${EVENT_NAME} checked_out=$(git rev-parse HEAD) secret_present=$([[ -n "${PROBE_SECRET}" ]] && echo yes || echo no)"
+          cat probe.txt 2>/dev/null || true
+          if [[ -f fail-playback ]]; then echo "fail-playback marker present"; exit 1; fi
+
+      - name: Record job result
+        id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: echo "result=${JOB_STATUS}" >> "$GITHUB_OUTPUT"
